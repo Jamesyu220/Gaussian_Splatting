@@ -1,0 +1,12 @@
+name: gaussian_splatting
+channels:
+- defaults
+dependencies:
+- matplotlib
+- numpy
+- tqdm
+- imageio
+- scikit-learn
+- notebook
+- jupyterlab
+- scikit-image
