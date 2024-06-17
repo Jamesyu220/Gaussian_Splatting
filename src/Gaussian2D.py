@@ -1,172 +1,156 @@
-import imageio
+import os
 import numpy as np
-# import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
+from PIL import Image
 from tqdm import tqdm
+from datetime import datetime
 
 # Check if GPU is available
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(device)
-SMALL_CONST = 1e-8
+SMALL_CONST = 1e-4
+
+#######################################################################################
+#  #
+#                                                                        #
+#######################################################################################
+
+def sigmoid(x):
+    sigma = 1. / (1. + torch.exp(-x))
+    return (sigma - 0.5) * 2.
+# pos: (N, 2)
+# mu: (K, 2)
+# sigma_x: (k)
+# sigma_y: (k)
+# rho: (k)
+# color: (k, 3)
+def construct_2DGS(pos, mu, sigma_x, sigma_y, rho, color):
+    pos = torch.unsqueeze(pos, 1)
+    mu = torch.unsqueeze(mu, 0)
+    diff = pos - mu
+
+    covariance = torch.stack(
+        [torch.stack([sigma_x**2, rho*sigma_x*sigma_y], dim=-1),
+        torch.stack([rho*sigma_x*sigma_y, sigma_y**2], dim=-1)],
+        dim=-2
+    )
+
+    inv_cov = torch.inverse(covariance)
+
+    expo = -0.5 * torch.einsum('nkj, kjp, nkp -> nk', diff, inv_cov, diff)
+    alpha = torch.exp(expo)
+    pred_img = torch.unsqueeze(color, 0) * torch.unsqueeze(alpha, -1)
+    pred_img = torch.sum(pred_img, dim=1)
+    # pred_img = torch.clamp(pred_img, min=0., max=1.)
+    pred_img = sigmoid(pred_img)
+    return pred_img
+
+def normalize(X, max):
+    return X / float(max)
+    
+def restore(X_n, max):
+    return X_n * float(max)
 
 class GS(nn.Module):
-    def __init__(self, K, mu, points):
+    def __init__(self, K, mu, color):
         super(GS, self).__init__()
-        # self.img = img
-        # H, W, _ = img.shape
-
-        # self.alpha = img[:, :, 3]
-        # self.alpha = nn.Parameter(self.alpha.float() / 255.)
-
-        # self.color = img[:, :, :3]
-        # self.color = nn.Parameter(self.color.float())
-
-        # np.random.seed(5) #Do Not Remove Seed
-        # idx = np.arange(H * W)
-        # pos_r = idx // W
-        # pos_c = idx % W
-        # self.pos = torch.from_numpy(np.hstack((pos_r[:, np.newaxis], pos_c[:, np.newaxis]))[:, np.newaxis, :]).float()
-        # self.pos.requires_grad_(False)
-
-        # selected_idx = np.random.choice(idx, size=K)
-        # si_r = selected_idx // W
-        # si_c = selected_idx % W
-        # si_r = si_r[:, np.newaxis]
-        # si_c = si_c[:, np.newaxis]
-        # self.mu = torch.from_numpy(np.hstack((si_r, si_c))[np.newaxis, :, :]).float()
-        # self.mu = nn.Parameter(self.mu)
         self.K = K
 
-        self.mu = torch.from_numpy(mu).to(device)
-        self.mu = self.mu.float()
-        self.mu = nn.Parameter(self.mu)
+        # self.mu = torch.from_numpy(mu).float().to(device)
+        self.mu = nn.Parameter(mu).to(device)
 
-        if points.shape[1] == 3:
-            self.include_opc = False
-            self.alpha = torch.ones(K).float()
-        else:
-            self.include_opc = True
-            self.alpha = points[:, 3]
-            # self.alpha = self.alpha.unsqueeze(0)
-            self.alpha = self.alpha / 255.
+        # self.color = points
+        self.color = nn.Parameter(color).to(device)
 
-        self.alpha = nn.Parameter(self.alpha).to(device)   # , requires_grad=False)
+        # self.scales = nn.Parameter(torch.ones(K, 2).float() * 10.).to(device)
+        # self.thetas = nn.Parameter(torch.zeros(K).float()).to(device)
 
-        self.color = points[:, :3]
-        self.color = nn.Parameter(self.color).to(device)   # , requires_grad=False)
-
-        self.scales = nn.Parameter(torch.ones(K, 2).float() * 10.0).to(device)
-        self.thetas = nn.Parameter(torch.zeros(K).float()).to(device)
+        sigma_bias = 0.08
+        self.sigma_x = nn.Parameter(sigma_bias + torch.rand(K) * 0.1).to(device)
+        self.sigma_y = nn.Parameter(sigma_bias + torch.rand(K) * 0.1).to(device)
+        self.rho = nn.Parameter(torch.rand(K) - 0.5).to(device)
 
     def forward(self, pos):
-        
-        # diff = pos - self.mu
-        # cos_thetas = torch.cos(self.thetas)
-        # sin_thetas = torch.sin(self.thetas)
-        # R = torch.stack([
-        #     torch.stack((cos_thetas, -sin_thetas), dim=-1),
-        #     torch.stack((sin_thetas, cos_thetas), dim=-1)
-        # ], dim=-2)
+        self.sigma_x = nn.Parameter(torch.clamp(self.sigma_x, min=SMALL_CONST, max=1.))
+        self.sigma_y = nn.Parameter(torch.clamp(self.sigma_y, min=SMALL_CONST, max=1.))
+        self.rho = nn.Parameter(torch.clamp(self.rho, min=-0.9, max=0.9))
+        self.color = nn.Parameter(torch.clamp(self.color, min=0., max=1.))
 
-        
-        # # scales_inv = torch.reciprocal(self.scales)
-        # # while torch.isnan(scales_inv).any():
-        # # self.scales += SMALL_CONST
-        # scales_inv = torch.reciprocal(self.scales + SMALL_CONST)
-            
-        # sigma_inv = torch.einsum('kti, kij -> ktj', torch.einsum('kij, kj -> kij', R, scales_inv), torch.transpose(R, 1, 2)).float()
-        # expo = -0.5 * torch.einsum('nkj, nkj -> nk', torch.einsum('nki, kij -> nkj', diff, sigma_inv), diff)
-        # alpha = self.alpha * torch.exp(expo)
-        self.alpha = nn.Parameter(torch.clamp(self.alpha, min=0., max=1.))
-        self.color = nn.Parameter(torch.clamp(self.color, min=0., max=255.))
-        self.scales = nn.Parameter(torch.clamp(self.scales, min=.1))
+        return construct_2DGS(pos=pos, mu=self.mu, sigma_x=self.sigma_x, sigma_y=self.sigma_y, rho=self.rho, color=self.color)
 
-        N = pos.shape[0]
-        pred_color = torch.zeros(N, 3).to(device)
-        pred_alpha = torch.zeros(N, 1).to(device)
-        find_nan = False
-        for k in range(self.K):
-            diff = pos - self.mu[k:(k+1), :]
-            # if torch.isnan(diff).any():
-            #     print("NAN in diff\n")
-            cos_theta = torch.cos(self.thetas[k])
-            sin_theta = torch.sin(self.thetas[k])
-            R = torch.stack([
-                torch.stack((cos_theta, -sin_theta), dim=-1),
-                torch.stack((sin_theta, cos_theta), dim=-1)
-            ], dim=-2)
-            
-            # if torch.isnan(R).any():
-            #     print("NAN in R\n")
-        
-            # scales_inv = torch.reciprocal(self.scales)
-            # while torch.isnan(scales_inv).any():
-            # self.scales += SMALL_CONST
-            # scales_inv = torch.reciprocal(self.scales[k, :])
-            diag_inv_squared_scales = torch.diag_embed((1.0 / (self.scales[k, :] ** 2)))
-            # if torch.isnan(scales_inv).any():
-            #     print("NAN in scales_inv\n")
-            
-            sigma_inv = torch.einsum('ti, ij, jk -> tk', R, diag_inv_squared_scales, R.transpose(0, 1)).float()
-            if not find_nan and torch.isinf(sigma_inv).any():
-                find_nan = True
-                print("INF in sigma_inv\n")
-            expo = -0.5 * torch.einsum('nj, nj -> n', torch.einsum('ni, ij -> nj', diff, sigma_inv), diff)
-            if not find_nan and torch.isinf(expo).any():
-                find_nan = True
-                print("INF in expo\n")
-            alpha_k = self.alpha[k] * torch.exp(expo)
-            alpha_k = alpha_k.unsqueeze(1)
-            color_k = self.color[k:(k+1), :]
-            if not find_nan and torch.isinf(alpha_k).any():
-                find_nan = True
-                print(f"NAN in self.alpha? {torch.isinf(self.alpha).any()}\n")
-                print(f"scales = \n{self.scales[k, :]}\n")
-                print(f"R = \n{R}\n")
-                print(f"mu = \n{self.mu[k:(k+1), :]}\n")
-                print("INF in alpha_k\n")
-            if not find_nan and torch.isinf(color_k).any():
-                find_nan = True
-                print("INF in color_k\n")
+# SSIM loss
+def create_window(window_size, channel):
+    def gaussian(window_size, sigma):
+        x = torch.arange(window_size)
+        gauss = torch.exp(- (x - window_size // 2)**2 / float(2 * sigma**2))
+        gauss = gauss / gauss.sum()
+        return gauss
 
-            new_alpha = pred_alpha + alpha_k * (1. - pred_alpha)
-            if not find_nan and torch.isnan(new_alpha).any():
-                print(f"alpha_k = {alpha_k}\n")
-                find_nan = True
-                print("NAN in alpha\n")
-            # pred_color = (pred_color * pred_alpha + color_k * alpha_k * (1. - pred_alpha)) / new_alpha
-            # while torch.isnan(pred_color).any():
-            # new_alpha += SMALL_CONST
-            pred_color = (pred_color * pred_alpha + color_k * alpha_k * (1. - pred_alpha)) / (new_alpha + SMALL_CONST)
-            if not find_nan and torch.isnan(pred_color).any():
-                find_nan = True
-                print("NAN in pred_color\n")
+    _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
+    _2D_window = _1D_window.mm(_1D_window.t()).float()
 
-            pred_alpha = new_alpha
+    window = _2D_window.unsqueeze(0).unsqueeze(0).expand(channel, 1, window_size, window_size).contiguous()
+    window = torch.autograd.Variable(window)
 
-            pred_color = torch.clamp(pred_color, min=0., max=255.)
-            pred_alpha = torch.clamp(pred_alpha, min=0., max=1.)
+    return window
 
-        if self.include_opc:
-            pred_img = torch.cat((pred_color, pred_alpha * 255.), dim=-1)
-        else:
-            pred_img = pred_color
 
-        return pred_img
+
+def ssim_loss(img1, img2, window_size=11):
+
+
+    # Assuming the image is of shape [N, C, H, W]
+    (_, _, channel) = img1.size()
+
+    img1 = img1.unsqueeze(0).permute(0, 3, 1, 2)
+    img2 = img2.unsqueeze(0).permute(0, 3, 1, 2)
+
+
+    # Parameters for SSIM
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+
+    window = create_window(window_size, channel)
+
+    if img1.is_cuda:
+        window = window.cuda(img1.get_device())
+    window = window.type_as(img1)
+
+    mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
+    mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channel)
+    mu1_sq = mu1 ** 2
+    mu2_sq = mu2 ** 2
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(img1 ** 2, window, padding=window_size // 2, groups=channel) - mu1_sq
+    sigma2_sq = F.conv2d(img2 ** 2, window, padding=window_size // 2, groups=channel) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=window_size // 2, groups=channel) - mu1_mu2
+
+    SSIM_numerator = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2))
+    SSIM_denominator = ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    SSIM = SSIM_numerator / SSIM_denominator
+    MSSIM = torch.clamp((1 - SSIM) / 2, 0, 1).mean()
+
+    return MSSIM
+
+# Combined Loss
+def combined_loss(pred, target, lambda_param=0.5):
+    l1loss = nn.L1Loss()
+    return (1 - lambda_param) * l1loss(pred, target) + lambda_param * ssim_loss(pred, target)
 
 class Gaussian2D(object):
-    def __init__(self, X, K, max_iters=100, lr = 0.1, momentum=0.5):  # No need to change
+    def __init__(self, img, K, max_iters=100, lr = 0.1, momentum=0.5):  # No need to change
         """
         Args:
             X: the observations/datapoints, N x D numpy array
             K: number of clusters/components
             max_iters: maximum number of iterations (used in EM implementation)
         """
-        self.target_img = torch.from_numpy(X)
+        self.target_img = torch.tensor(img, dtype=torch.float32, device=device)
         # self.target_img = self.target_img.float()
-        self.H, self.W, self.D = X.shape    # seld.D: number of dimentions, for colored picture, 4: R, G, B, a
+        self.H, self.W, self.D = img.shape    # seld.D: number of dimentions, for colored picture, 3: R, G, B
         self.K = K  # number of components/clusters
         self.max_iters = max_iters
         self.lr = lr
@@ -188,15 +172,21 @@ class Gaussian2D(object):
         selected_idx = np.random.choice(idx, size=self.K)
         si_r = selected_idx // self.W
         si_c = selected_idx % self.W
-        self.points = self.target_img[si_r, si_c, :]
-        si_r = si_r[:, np.newaxis]
-        si_c = si_c[:, np.newaxis]
-        self.mu = np.hstack((si_r, si_c))
+        self.color = self.target_img[si_r, si_c, :]
+
+        si_r = torch.tensor(si_r, dtype=torch.float32)
+        si_r = normalize(si_r, self.H)
+        si_c = torch.tensor(si_c, dtype=torch.float32)
+        si_c = normalize(si_c, self.W)
+        self.mu = torch.stack((si_r, si_c), dim=-1)
+
 
         pos_r = idx // self.W
+        pos_r = normalize(pos_r, self.H)
         pos_c = idx % self.W
-        self.pos = torch.from_numpy(np.hstack((pos_r[:, np.newaxis], pos_c[:, np.newaxis]))).to(device)
-        self.pos = self.pos.float()
+        pos_c = normalize(pos_c, self.W)
+        self.pos = torch.from_numpy(np.hstack((pos_r[:, np.newaxis], pos_c[:, np.newaxis]))).float()
+        self.pos = self.pos.to(device)
 
     def __call__(self, abs_tol=1e-16, rel_tol=1e-16):  # No need to change
         """
@@ -212,10 +202,15 @@ class Gaussian2D(object):
         Hint:
             You do not need to change it. For each iteration, we process E and M steps, then update the paramters.
         """
-        
+        now = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
+        # Create a directory with the current date and time as its name
+        directory = f"./data/images/{now}_{self.K}_{self.max_iters}"
+        os.makedirs(directory, exist_ok=True)
+
         self._init_centers()
-        model = GS(self.K, self.mu, self.points)
-        optimizer = torch.optim.SGD(model.parameters(), lr=self.lr, momentum=self.momentum)     # Adam
+        model = GS(self.K, self.mu, self.color)
+
+        optimizer = optim.SGD(model.parameters(), lr=self.lr, momentum=self.momentum)     # Adam
 
         pbar = tqdm(range(self.max_iters))
         prev_loss = None
@@ -224,11 +219,12 @@ class Gaussian2D(object):
         i = 0
         for it in pbar:
             predicted_img = model(self.pos)
+            predicted_img = predicted_img.reshape(self.H, self.W, self.D)
             # print(f"predicted img: \n{predicted_img}\n")
             # print(f"scales: {model.scales}\n")
             # print(f"thetas: {model.thetas}\n")
             # print(f"shape of predicted img: {predicted_img.shape}\n")
-            loss = torch.nn.L1Loss()(predicted_img, self.target_img.reshape(-1, self.D))   # MSELoss
+            loss = combined_loss(pred=predicted_img, target=self.target_img, lambda_param=0.2)  # MSELoss
             if torch.isnan(loss):
                 print(f"There is a nan in pred_img? {torch.isnan(predicted_img).any()}")
                 predicted_img = prev_img
@@ -254,20 +250,27 @@ class Gaussian2D(object):
                 if diff < 0:
                     diff = -diff
                 if diff < abs_tol and diff / prev_loss < rel_tol:
+                    print(f"diff = {diff}, current_loss = {loss}")
                     print("Training end!")
                     break
             prev_loss = loss
             prev_img = predicted_img
             pbar.set_description('iter %d, loss: %.4f' % (it, loss))
+
+            if i % 5 == 0:
+                generated_img = Image.fromarray((predicted_img.detach().numpy() * 255.).astype(np.uint8))
+                filename = f"/iter_{i}.jpg"
+                filename = directory + filename
+                generated_img.save(filename)
+
         
-        print(f"Final scales: \n{model.scales}\n")
-        predicted_img = predicted_img.reshape(self.H, self.W, self.D)
+        print(f"Final scales: \n{model.sigma_x}\n\n{model.sigma_y}\n")
         return predicted_img.detach().numpy(), iter_list, loss_list
 
 # the direction of two images. Both of them are from ImageNet
 # img1_dir = "./data/images/anakin-its-working-medium.png"
 # img2_dir = "./data/images/gmm-example4.png"
-# K=2000
+# K=1
 # max_iters=10
 
 # image = imageio.v2.imread(img2_dir)
