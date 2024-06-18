@@ -6,7 +6,7 @@ folder_name = '2024_06_17-12_07_28'
 # Path to the directory containing .jpg images
 image_folder = './data/images/' + folder_name
 # Path to save the output video
-output_video_path = './data/video/' + folder_name + '.avi'
+output_video_path = './data/video/' + folder_name + '.mp4'
 # Video settings
 frame_rate = 2
 video_codec = cv2.VideoWriter_fourcc(*'XVID')  # You can use other codecs like 'MJPG', 'MP4V', etc.
@@ -24,7 +24,7 @@ video = cv2.VideoWriter(output_video_path, video_codec, frame_rate, (width, heig
 
 # Iterate through images and write them to the video
 for image in images:
-    print(image)
+    # print(image)
     img_path = os.path.join(image_folder, image)
     img = cv2.imread(img_path)
     video.write(img)
